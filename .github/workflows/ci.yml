@@ -1,0 +1,134 @@
+name: Build Ente Desktop (custom Electron)
+
+# Builds the desktop app from ente-io/ente for Linux + Windows + macOS, pinned
+# to a chosen Electron version. Default 41.7.1 is the version Equibop ships,
+# which fixes the clipped-cursor bug on GNOME < 47.4 Wayland (ente upstream is
+# on 41.2.0).
+#
+# Win/mac are built UNSIGNED (no Apple/Azure secrets needed):
+#   - Windows: SmartScreen will warn -> More info -> Run anyway.
+#   - macOS:   Gatekeeper blocks it. Users bypass with:
+#                xattr -dr com.apple.quarantine "/Applications/ente photos.app"
+#              (Apple Silicon may also need: codesign --force --deep -s - <app>)
+#
+# The API endpoint is baked into the web bundle at build time, so the binaries
+# are preconfigured for your self-hosted instance out of the box.
+#
+# This repo only needs to contain this file; the job checks out ente-io/ente
+# itself and builds its desktop/ subdir. Run it from the Actions tab.
+#
+# NOTE: install the blacksmith.sh GitHub App on THIS repo, or the runners queue
+# forever (and can siphon runners provisioned for your other Blacksmith repos).
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "ente-io/ente branch or tag to build"
+        type: string
+        default: "main"
+      electron_version:
+        description: "Electron version to pin"
+        type: string
+        default: "41.7.1"
+      ente_endpoint:
+        description: "Self-hosted API endpoint (blank = Ente cloud)"
+        type: string
+        default: "https://ente.apex.to"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: blacksmith-4vcpu-ubuntu-2404
+            flag: linux
+            extra_args: ""
+          - os: blacksmith-4vcpu-windows-2025
+            flag: windows
+            extra_args: ""
+          - os: blacksmith-6vcpu-macos-latest
+            flag: mac
+            # Override in case upstream config has notarization switched on,
+            # which would otherwise fail without Apple credentials.
+            extra_args: "-c.mac.notarize=false"
+
+    steps:
+      - name: Checkout ente-io/ente
+        uses: actions/checkout@v6
+        with:
+          repository: ente-io/ente
+          ref: ${{ inputs.source || 'main' }}
+
+      - name: Setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "npm"
+          cache-dependency-path: "desktop/package-lock.json"
+
+      # Install the exact tree ente locked, so only Electron changes below.
+      - name: Install dependencies (pinned tree)
+        run: npm ci
+
+      # Bump ONLY electron + its deps, reconciling the lockfile in place.
+      - name: Pin Electron to ${{ inputs.electron_version || '41.7.1' }}
+        run: |
+          npm install --save-dev electron@${{ inputs.electron_version || '41.7.1' }}
+          node -p "'Electron now: ' + require('electron/package.json').version"
+
+      # macOS ships universal (Intel + Apple Silicon); ffmpeg-static isn't
+      # universal upstream, so fetch both arches and lipo them together.
+      - name: Create universal ffmpeg binary (macOS)
+        if: matrix.flag == 'mac'
+        run: |
+          rm -f node_modules/ffmpeg-static/ffmpeg
+          npm_config_arch=arm64 node node_modules/ffmpeg-static/install.js
+          mv node_modules/ffmpeg-static/ffmpeg ffmpeg-arm64
+          npm_config_arch=x64 node node_modules/ffmpeg-static/install.js
+          mv node_modules/ffmpeg-static/ffmpeg ffmpeg-x64
+          lipo -create ffmpeg-arm64 ffmpeg-x64 -output node_modules/ffmpeg-static/ffmpeg
+          rm ffmpeg-arm64 ffmpeg-x64
+          file node_modules/ffmpeg-static/ffmpeg
+
+      - name: Install libarchive-tools (Linux, for pacman target)
+        if: matrix.flag == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+
+      - name: Build
+        shell: bash
+        run: |
+          npm run build:ci
+          npm exec -- electron-builder --${{ matrix.flag }} ${{ matrix.extra_args }} --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Build unsigned without electron-builder erroring on a missing cert.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          # Workaround per electron-builder#3179
+          USE_HARD_LINKS: false
+          # Baked into the web bundle at build time. Empty = Ente cloud.
+          NEXT_PUBLIC_ENTE_ENDPOINT: ${{ inputs.ente_endpoint }}
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ente-desktop-${{ matrix.flag }}
+          # Paths are relative to the repo root, not the working-directory.
+          # The superset glob is fine; non-matching patterns just match nothing.
+          path: |
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+            desktop/dist/*.rpm
+            desktop/dist/*.dmg
+            desktop/dist/*.zip
+            desktop/dist/*.exe
+          if-no-files-found: warn
