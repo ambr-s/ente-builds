@@ -5,7 +5,7 @@ Rebuilds of the [Ente Photos](https://ente.io) desktop app, preconfigured for th
 Builds are produced for **Linux, Windows and macOS** and published to this repo's [Releases](../../releases). Once installed, the app keeps itself up to date automatically (see [Auto-updates](#auto-updates)).
 
 > [!NOTE]
-> These builds talk to `ente.apex.to`. If that isn't your server, you'll have to override the server or the official app from [ente.io/download](https://ente.io/download) instead.
+> These builds talk to `ente.apex.to`. If that isn't your server, you'll have to override the server or get the official app from [ente.io/download](https://ente.io/download) instead.
 
 ## Install
 
