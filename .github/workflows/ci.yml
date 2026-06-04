@@ -1,46 +1,66 @@
 name: Build Ente Desktop (custom Electron)
 
 # Builds the desktop app from ente-io/ente for Linux + Windows + macOS, pinned
-# to a chosen Electron version. Default 41.7.1 is the version Equibop ships,
-# which fixes the clipped-cursor bug on GNOME < 47.4 Wayland (ente upstream is
-# on 41.2.0).
+# to Electron 42.3.2 (latest stable as of 2026-06; past 41.7.1, so the GNOME
+# Wayland clipped-cursor fix is included).
 #
-# Win/mac are built UNSIGNED (no Apple/Azure secrets needed):
-#   - Windows: SmartScreen will warn -> More info -> Run anyway.
-#   - macOS:   Gatekeeper blocks it. Users bypass with:
-#                xattr -dr com.apple.quarantine "/Applications/ente photos.app"
-#              (Apple Silicon may also need: codesign --force --deep -s - <app>)
+# CADENCE: a cheap daily "check" job compares the latest ente-io/photos-desktop
+# release against this repo's latest release. The (expensive) build only runs
+# when they differ, or on manual dispatch. The detected upstream version is
+# piped into the build, so this repo's releases mirror ente's version numbers
+# exactly -> electron-updater semver autoupdate lines up.
 #
-# The API endpoint is baked into the web bundle at build time, so the binaries
-# are preconfigured for your self-hosted instance out of the box.
+# AUTOUPDATE: all three platforms publish to ambr-s/ente-builds Releases.
+#   - This repo must be PUBLIC (apps read releases unauthenticated).
+#   - Linux: run the .AppImage directly ($APPIMAGE must be set). No signing.
+#   - Windows: UNSIGNED. Updates work; SmartScreen warns on first install only.
+#   - macOS: SELF-SIGNED (secrets MAC_CSC_LINK + MAC_CSC_KEY_PASSWORD) so
+#       Squirrel.Mac accepts cross-version updates. Not notarized -> first
+#       install needs: xattr -dr com.apple.quarantine "/Applications/ente photos.app"
+#       Absent secrets -> mac falls back to unsigned (no autoupdate).
 #
-# This repo only needs to contain this file; the job checks out ente-io/ente
-# itself and builds its desktop/ subdir. Run it from the Actions tab.
-#
-# NOTE: install the blacksmith.sh GitHub App on THIS repo, or the runners queue
-# forever (and can siphon runners provisioned for your other Blacksmith repos).
+# NOTE: install the blacksmith.sh GitHub App on THIS repo, or the runners queue.
 
 on:
+  schedule:
+    - cron: "0 6 * * *"   # daily peek; just an API call on a free runner
   workflow_dispatch:
     inputs:
-      source:
-        description: "ente-io/ente branch or tag to build"
+      version_override:
+        description: "Force a version (blank = use detected upstream). Bump to re-push the same upstream version."
         type: string
-        default: "main"
-      electron_version:
-        description: "Electron version to pin"
-        type: string
-        default: "41.7.1"
-      ente_endpoint:
-        description: "Self-hosted API endpoint (blank = Ente cloud)"
-        type: string
-        default: "https://ente.apex.to"
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
+  # ---- cheap gate: is there a new upstream release? -------------------------
+  check:
+    runs-on: ubuntu-latest      # free GH runner, NOT blacksmith — it's one curl
+    outputs:
+      go:  ${{ steps.c.outputs.go }}
+      ver: ${{ steps.c.outputs.ver }}
+    steps:
+      - id: c
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          up=$(gh api repos/ente-io/photos-desktop/releases/latest --jq .tag_name)
+          mine=$(gh api repos/ambr-s/ente-builds/releases/latest --jq .tag_name 2>/dev/null || echo none)
+          up_n="${up#v}"; mine_n="${mine#v}"   # normalise the v prefix on both
+          echo "upstream=$up  mine=$mine"
+          if [ "$up_n" != "$mine_n" ]; then
+            echo "go=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ver=$up_n" >> "$GITHUB_OUTPUT"
+
+  # ---- the real build (only when new, or manual) ----------------------------
   build:
+    needs: check
+    if: needs.check.outputs.go == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -48,6 +68,9 @@ jobs:
 
     strategy:
       fail-fast: false
+      # Serialize: all three publish to the same release; parallel "create
+      # release" calls can race. Only adds wall-clock, not cost.
+      max-parallel: 1
       matrix:
         include:
           - os: blacksmith-4vcpu-ubuntu-2404
@@ -55,19 +78,17 @@ jobs:
             extra_args: ""
           - os: blacksmith-4vcpu-windows-2025
             flag: windows
-            extra_args: ""
+            extra_args: "-c.win.azureSignOptions=null -c.win.azureSignToolOptions=null"
           - os: blacksmith-6vcpu-macos-latest
             flag: mac
-            # Override in case upstream config has notarization switched on,
-            # which would otherwise fail without Apple credentials.
-            extra_args: "-c.mac.notarize=false"
+            extra_args: "-c.mac.notarize=false -c.mac.hardenedRuntime=false -c.mac.identity=amber-self-signed-codesign"
 
     steps:
       - name: Checkout ente-io/ente
         uses: actions/checkout@v6
         with:
           repository: ente-io/ente
-          ref: ${{ inputs.source || 'main' }}
+          ref: main
 
       - name: Setup node
         uses: actions/setup-node@v6
@@ -76,18 +97,14 @@ jobs:
           cache: "npm"
           cache-dependency-path: "desktop/package-lock.json"
 
-      # Install the exact tree ente locked, so only Electron changes below.
       - name: Install dependencies (pinned tree)
         run: npm ci
 
-      # Bump ONLY electron + its deps, reconciling the lockfile in place.
-      - name: Pin Electron to ${{ inputs.electron_version || '41.7.1' }}
+      - name: Pin Electron to 42.3.2
         run: |
-          npm install --save-dev electron@${{ inputs.electron_version || '41.7.1' }}
+          npm install --save-dev electron@42.3.2
           node -p "'Electron now: ' + require('electron/package.json').version"
 
-      # macOS ships universal (Intel + Apple Silicon); ffmpeg-static isn't
-      # universal upstream, so fetch both arches and lipo them together.
       - name: Create universal ffmpeg binary (macOS)
         if: matrix.flag == 'mac'
         run: |
@@ -104,26 +121,37 @@ jobs:
         if: matrix.flag == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools
 
-      - name: Build
+      - name: Build & publish
         shell: bash
         run: |
+          # version_override (manual) wins; otherwise pin to the detected
+          # upstream version so our release tag matches ente's.
+          PIN="${{ inputs.version_override }}"
+          [ -z "$PIN" ] && PIN="${{ needs.check.outputs.ver }}"
+          VER_ARG=""
+          [ -n "$PIN" ] && VER_ARG="-c.extraMetadata.version=$PIN"
+          echo "Building version: ${PIN:-<ente default>}"
+
           npm run build:ci
-          npm exec -- electron-builder --${{ matrix.flag }} ${{ matrix.extra_args }} --publish never
+          npm exec -- electron-builder --${{ matrix.flag }} ${{ matrix.extra_args }} \
+            -c.publish.provider=github \
+            -c.publish.owner=ambr-s \
+            -c.publish.repo=ente-builds \
+            -c.publish.releaseType=release \
+            --publish always $VER_ARG
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Build unsigned without electron-builder erroring on a missing cert.
-          CSC_IDENTITY_AUTO_DISCOVERY: false
+          # Self-signed cert injected on the mac leg only; empty elsewhere.
+          CSC_LINK: ${{ matrix.flag == 'mac' && secrets.MAC_CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.flag == 'mac' && secrets.MAC_CSC_KEY_PASSWORD || '' }}
           # Workaround per electron-builder#3179
           USE_HARD_LINKS: false
-          # Baked into the web bundle at build time. Empty = Ente cloud.
-          NEXT_PUBLIC_ENTE_ENDPOINT: ${{ inputs.ente_endpoint }}
+          NEXT_PUBLIC_ENTE_ENDPOINT: https://ente.apex.to
 
-      - name: Upload build
+      - name: Upload build (backup copy of artifacts)
         uses: actions/upload-artifact@v4
         with:
           name: ente-desktop-${{ matrix.flag }}
-          # Paths are relative to the repo root, not the working-directory.
-          # The superset glob is fine; non-matching patterns just match nothing.
           path: |
             desktop/dist/*.AppImage
             desktop/dist/*.deb
