@@ -76,10 +76,13 @@ jobs:
           - os: blacksmith-4vcpu-ubuntu-2404
             flag: linux
             extra_args: ""
-          - os: blacksmith-4vcpu-windows-2025
+          - os: windows-2025
             flag: windows
-            extra_args: "-c.win.azureSignOptions=null -c.win.azureSignToolOptions=null"
-          - os: blacksmith-6vcpu-macos-latest
+            # Upstream's config enables Azure Trusted Signing. Generate an
+            # unsigned copy below; CLI dot-notation overrides turn null into
+            # a string (and azureSignToolOptions is not a supported option).
+            extra_args: "--config electron-builder-unsigned.yml"
+          - os: macos-latest
             flag: mac
             extra_args: "-c.mac.notarize=false -c.mac.hardenedRuntime=false -c.mac.identity=amber-self-signed-codesign"
 
@@ -104,6 +107,14 @@ jobs:
         run: |
           npm install --save-dev electron@42.3.2
           node -p "'Electron now: ' + require('electron/package.json').version"
+
+      - name: Fetch binary dependencies and rebuild native modules
+        run: npm run postinstall
+
+      - name: Prepare unsigned Windows electron-builder config
+        if: matrix.flag == 'windows'
+        run: |
+          node -e "const fs=require('node:fs'); const yaml=require('js-yaml'); const config=yaml.load(fs.readFileSync('electron-builder.yml','utf8')); delete config.win.azureSignOptions; fs.writeFileSync('electron-builder-unsigned.yml', yaml.dump(config));"
 
       - name: Create universal ffmpeg binary (macOS)
         if: matrix.flag == 'mac'
@@ -144,6 +155,9 @@ jobs:
           # Self-signed cert injected on the mac leg only; empty elsewhere.
           CSC_LINK: ${{ matrix.flag == 'mac' && secrets.MAC_CSC_LINK || '' }}
           CSC_KEY_PASSWORD: ${{ matrix.flag == 'mac' && secrets.MAC_CSC_KEY_PASSWORD || '' }}
+          # Required when electron-builder cross-compiles the Linux arm64 N-API addon.
+          TARGET_CC: ${{ matrix.flag == 'linux' && 'clang' || '' }}
+          TARGET_CXX: ${{ matrix.flag == 'linux' && 'clang++' || '' }}
           # Workaround per electron-builder#3179
           USE_HARD_LINKS: false
           NEXT_PUBLIC_ENTE_ENDPOINT: https://ente.apex.to
